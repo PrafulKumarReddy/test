@@ -1,0 +1,123 @@
+from panos.panorama import Panorama
+from panos.firewall import Firewall
+import requests
+import xml.etree.ElementTree as ET
+import pandas as pd
+from datetime import datetime
+
+# Configuration
+PANORAMA_IP = "your-panorama-ip"
+API_KEY = "your-api-key"
+THREAT_VAULT_API_KEY = "your-threat-vault-key"
+
+def get_latest_versions():
+    """Fetch latest versions from Threat Vault and update servers"""
+    latest = {
+        'app_threat': None,
+        'wildfire': None,
+        'url_filtering': datetime.now().strftime("%Y%m%d")
+    }
+    
+    # Get Applications & Threats version
+    try:
+        response = requests.get(
+            f"https://api.threatvault.paloaltonetworks.com/service/v1/release-notes?type=content",
+            headers={'X-API-KEY': THREAT_VAULT_API_KEY}
+        )
+        latest['app_threat'] = response.json()['data'][0]['content_version']
+    except Exception as e:
+        print(f"Error fetching app/threat version: {str(e)}")
+    
+    # Get WildFire version (example format: 123456-123456)
+    try:
+        response = requests.get(
+            f"https://api.threatvault.paloaltonetworks.com/service/v1/release-notes?type=wildfire",
+            headers={'X-API-KEY': THREAT_VAULT_API_KEY}
+        )
+        latest['wildfire'] = response.json()['data'][0]['content_version']
+    except Exception as e:
+        print(f"Error fetching wildfire version: {str(e)}")
+
+    return latest
+
+def check_firewall_versions(fw, latest_versions):
+    """Check versions for a single firewall"""
+    results = {}
+    try:
+        # Get system info
+        sys_info = fw.op("show system info")
+        
+        # Current versions
+        current = {
+            'app_threat': sys_info.find(".//app-version").text,
+            'wildfire': sys_info.find(".//wildfire-version").text.split('-')[0],
+            'url_filtering': sys_info.find(".//url-filtering-version").text,
+            'url_connected': sys_info.find(".//cloud-connection").text.lower() == "connected"
+        }
+        
+        # Version comparisons
+        results = {
+            'hostname': fw.hostname,
+            'ip_address': fw.management_ip,
+            'app_threat_current': current['app_threat'],
+            'app_threat_latest': latest_versions['app_threat'],
+            'wildfire_current': current['wildfire'],
+            'wildfire_latest': latest_versions['wildfire'],
+            'url_current': current['url_filtering'],
+            'url_expected': latest_versions['url_filtering'],
+            'url_connected': current['url_connected'],
+            'status': []
+        }
+        
+        # Check app/threat
+        if current['app_threat'] != latest_versions['app_threat']:
+            results['status'].append('app_threat_outdated')
+            
+        # Check wildfire
+        if current['wildfire'] != latest_versions['wildfire']:
+            results['status'].append('wildfire_outdated')
+            
+        # Check URL filtering
+        if not current['url_connected'] or current['url_filtering'] == '0000.00.00.000':
+            results['status'].append('url_not_synced')
+        elif current['url_filtering'] < latest_versions['url_filtering']:
+            results['status'].append('url_outdated')
+            
+    except Exception as e:
+        print(f"Error checking {fw.hostname}: {str(e)}")
+        results['status'] = ['check_failed']
+    
+    return results
+
+def main():
+    # Connect to Panorama
+    pano = Panorama(PANORAMA_IP, api_key=API_KEY)
+    
+    # Get latest versions
+    latest_versions = get_latest_versions()
+    
+    # Retrieve managed firewalls
+    firewalls = []
+    device_groups = pano.refresh_devices()
+    
+    for dg in device_groups:
+        firewalls.extend(dg.children)
+    
+    # Check each firewall
+    report = []
+    for fw in firewalls:
+        firewall = Firewall(serial=fw.serial, panorama=pano)
+        report.append(check_firewall_versions(firewall, latest_versions))
+    
+    # Generate output
+    df = pd.DataFrame([r for r in report if r])
+    if not df.empty:
+        output_file = f"firewall_version_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        df.to_csv(output_file, index=False)
+        print(f"Report generated: {output_file}")
+        print(df[['hostname', 'ip_address', 'status']])
+    else:
+        print("No firewalls found or all are up-to-date")
+
+if __name__ == "__main__":
+    main()
